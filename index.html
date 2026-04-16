@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#080c14" />
+  <title>BinRoute — Delivery Route Planner</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- TOAST -->
+<div id="toast-container"></div>
+
+<!-- INLINE LOADER (sidebar-level, not fullscreen) -->
+<div class="inline-loader hidden" id="inline-loader">
+  <span class="spin">⟳</span>
+  <span id="inline-loader-text">Loading…</span>
+</div>
+
+<!-- SHEET BACKDROP -->
+<div class="sheet-backdrop" id="sheet-backdrop"></div>
+
+<!-- STOP BOTTOM SHEET -->
+<div class="stop-sheet" id="stop-sheet">
+  <div class="sheet-handle"></div>
+  <button class="sheet-close" id="sheet-close">✕</button>
+  <div class="sheet-title" id="sheet-title">Stop Name</div>
+  <div class="sheet-meta" id="sheet-meta"></div>
+  <div class="sheet-btns">
+    <button class="btn btn-amber" id="sheet-btn-go">↗ Go to tip-off</button>
+    <button class="btn btn-success" id="sheet-btn-done">✓ Mark done</button>
+    <button class="btn btn-secondary" id="sheet-btn-nav">🗺 Open in Maps</button>
+  </div>
+</div>
+
+<!-- APP SHELL -->
+<div class="app">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="brand-icon">🚛</div>
+    <div>
+      <div class="brand-name">BinRoute</div>
+      <div class="brand-tag">Route Planner</div>
+    </div>
+
+    <div class="header-stats">
+      <div class="stat-pill"><span class="dot"></span>Stops: <strong id="stat-total">0</strong></div>
+      <div class="stat-pill"><span class="dot green"></span>Done: <strong id="stat-done">0</strong></div>
+      <div class="stat-pill"><span class="dot amber"></span>Left: <strong id="stat-pending">0</strong></div>
+      <div class="stat-pill"><span class="dot red"></span>Depots: <strong id="stat-depots">0</strong></div>
+    </div>
+
+    <button class="header-btn" id="btn-optimise">⚡ Optimise</button>
+  </header>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <nav class="sidebar-tabs">
+      <button class="tab-btn active" data-tab="tab-route">Route</button>
+      <button class="tab-btn" data-tab="tab-depot">Depot</button>
+      <button class="tab-btn" data-tab="tab-settings">Settings</button>
+    </nav>
+
+    <div class="sidebar-body">
+
+      <!-- ── TAB: ROUTE ── -->
+      <div class="tab-panel active" id="tab-route">
+
+        <div class="progress-row" id="progress-row">
+          <div class="progress-pct">0%</div>
+          <div class="progress-info">
+            <div>0 of 0 stops complete</div>
+            <div class="progress-label">0 remaining</div>
+          </div>
+        </div>
+
+        <div class="load-bar-wrap">
+          <div class="load-bar-header">
+            <span class="text-mono text-muted">Van Load</span>
+            <span class="text-mono text-muted" id="load-label">0 / 20 bins</span>
+          </div>
+          <div class="load-bar-track">
+            <div class="load-bar-fill" id="load-fill" style="width:0%"></div>
+          </div>
+        </div>
+
+        <div class="section-label">Stop Order</div>
+        <div class="route-list" id="route-list">
+          <div class="empty-state">
+            <div class="empty-icon">🗺️</div>
+            Geocoding stops from config…
+          </div>
+        </div>
+
+        <div class="btn-row mt-12">
+          <button class="btn btn-success" id="btn-mark-all">✅ All Done</button>
+          <button class="btn btn-secondary" id="btn-recalc">🔄 Recalculate</button>
+        </div>
+
+        <div class="mt-12 text-muted" style="font-size:0.72rem;font-family:var(--font-mono);line-height:1.7;padding:10px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);">
+          <strong style="color:var(--amber)">Tap a stop dot on the map</strong> to open its action menu.
+          Press <em>Go to tip-off</em> to activate navigation to that stop.
+        </div>
+      </div>
+
+      <!-- ── TAB: DEPOT ── -->
+      <div class="tab-panel" id="tab-depot">
+
+        <div class="section-label">Start Point</div>
+        <div id="depot-selector">
+          <div class="depot-option selected">
+            <div class="dot-green"></div>
+            <div class="depot-option-name">📍 Your Location</div>
+          </div>
+        </div>
+
+        <div class="section-label mt-16">Add Depot / Base</div>
+        <div class="field">
+          <label>Address</label>
+          <input type="text" id="input-add-depot" placeholder="e.g. 1 Wiri Station Rd, Māngere" autocomplete="off" />
+          <div class="ac-list hidden" id="depot-ac-list"></div>
+        </div>
+        <button class="btn btn-success btn-full" id="btn-add-depot">+ Add Depot</button>
+
+        <p class="text-muted mt-12" style="line-height:1.65;font-family:var(--font-mono);font-size:0.72rem;">
+          Drop-off stops are set permanently in <strong>config.js</strong> and cannot be changed here.
+          Only depots/home bases can be added at runtime.
+        </p>
+      </div>
+
+      <!-- ── TAB: SETTINGS ── -->
+      <div class="tab-panel" id="tab-settings">
+
+        <div class="section-label">Route</div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Real Roads (OSRM)</div>
+            <div class="setting-desc">Actual road routing vs straight lines</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="toggle-real-roads" />
+            <div class="toggle-track"></div>
+          </label>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Route Colour</div>
+            <div class="setting-desc">Polyline colour on map</div>
+          </div>
+          <input type="color" id="input-route-color" value="#38bdf8"
+            style="width:34px;height:26px;border-radius:6px;border:1px solid var(--border);background:var(--surface-2);cursor:pointer;" />
+        </div>
+
+        <div class="section-label mt-16">Speed</div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Speed Units</div>
+            <div class="setting-desc">Display on HUD</div>
+          </div>
+          <select id="input-speed-units" style="width:90px;padding:5px 8px;font-size:0.78rem;">
+            <option value="kmh">km/h</option>
+            <option value="mph">mph</option>
+          </select>
+        </div>
+
+        <div class="section-label mt-16">Van</div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Van Capacity</div>
+            <div class="setting-desc">Max bins before warning</div>
+          </div>
+          <input type="number" id="input-capacity" value="20" min="1" max="999"
+            style="width:60px;text-align:center;padding:5px 8px;border-radius:6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);font-family:var(--font-mono);" />
+        </div>
+
+        <div class="section-label mt-16">About</div>
+        <div class="text-muted" style="font-size:0.72rem;font-family:var(--font-mono);line-height:1.8;">
+          BinRoute v2.0<br>
+          Map: OpenStreetMap + Leaflet<br>
+          Speed zones: OpenStreetMap / Overpass API<br>
+          Routing: Nearest-neighbour + OSRM optional<br><br>
+          Edit <strong>config.js</strong> to change drop-offs, depots, capacity, colours.
+        </div>
+      </div>
+
+    </div><!-- /sidebar-body -->
+  </aside>
+
+  <!-- MAP PANEL -->
+  <section class="map-panel">
+    <div id="map"></div>
+
+    <!-- Legend -->
+    <div class="map-badge-strip">
+      <div class="map-badge"><span style="width:7px;height:7px;border-radius:50%;background:#f43f5e;display:inline-block"></span>You</div>
+      <div class="map-badge"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block"></span>Depot</div>
+      <div class="map-badge"><span style="width:7px;height:7px;border-radius:50%;background:#f59e0b;display:inline-block"></span>Stop</div>
+      <div class="map-badge"><span style="width:7px;height:7px;border-radius:50%;background:#38bdf8;display:inline-block"></span>Active</div>
+      <div class="map-badge"><span style="width:7px;height:7px;border-radius:50%;background:#64748b;display:inline-block"></span>Done</div>
+    </div>
+
+    <!-- Zoom mode badge -->
+    <div class="zoom-badge">
+      <span id="zoom-mode-label">Overview</span> view
+    </div>
+
+    <!-- Speed HUD -->
+    <div class="speed-hud">
+      <div class="hud-speed" id="hud-speed">0</div>
+      <div class="hud-units" id="hud-units">km/h</div>
+      <div class="hud-limit" id="hud-limit"></div>
+      <div class="hud-zone-label">zone</div>
+    </div>
+
+    <!-- FABs -->
+    <div class="fab-group top-right">
+      <button class="fab-btn fab-recenter" id="fab-recenter" title="Recenter on my location">⊕</button>
+      <button class="fab-btn" id="fab-fit" title="Fit all stops">⛶</button>
+    </div>
+
+  </section>
+
+</div><!-- /app -->
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+
+</body>
+</html>
