@@ -1,825 +1,878 @@
-/* ============================================================
-   BINROUTE — APP LOGIC v2
-   • Permanent config-only drop-offs
-   • Tap marker → bottom sheet → "Go to tip-off" activates it
-   • Live speed HUD (user speed + zone limit from Overpass)
-   • Address autocomplete with partial-match search
-   • Inline loading indicators (no full-screen takeover)
-   • Recenter FAB + adaptive zoom (far/near = 2D/3D feel)
-   ============================================================ */
-
+/* ═══════════════════════════════════════════════════════════════
+   BINROUTE v3 — APP.JS
+   Map-as-canvas, mobile-first, fully automated delivery routing
+═══════════════════════════════════════════════════════════════ */
 "use strict";
 
-// ── STATE ──────────────────────────────────────────────────
-const State = {
-  map: null,
-  userMarker: null,
-  userLocation: null,       // { lat, lon }
-  userHeading: null,
-  userSpeed: 0,             // m/s from GPS
-  watchId: null,
+// ── STATE ──────────────────────────────────────────────────────
+const S = {
+  map:          null,
+  tileLayer:    null,
+  currentStyle: null,
 
-  depots: [],               // { name, lat, lon } — geocoded
-  dropOffs: [],             // { name, lat, lon, done, active, marker }
+  userMarker:   null,
+  userLat:      null,
+  userLon:      null,
+  userSpeed:    0,       // m/s
+  userHeading:  null,
+  watchId:      null,
+  followMode:   true,    // auto-pan to user
 
-  route: [],                // ordered stop objects
-  routeLayer: null,
+  depots:   [],   // { address, label, lat, lon, marker }
+  stops:    [],   // { address, label, lat, lon, done, active, marker, etaMin, distM, order }
+  route:    [],   // ordered array of stop objects (first = start)
+  routeLayers: [],
 
-  selectedDepotIdx: 0,      // 0 = user loc, 1+ = depots[i-1]
-  activeDropIdx: null,      // currently navigating to
+  activeIdx:    null,   // index in S.stops of current target
+  tilt3d:       false,
 
-  zoneSpeedKmh: null,       // from Overpass; null = unknown
-  speedLookupTimer: null,
-  speedLookupLast: 0,
+  zoneKmh:      null,
+  speedTimer:   null,
 
-  isGeocoding: false,
-  geocodeQueue: 0,          // count of in-flight geocodes for inline loader
+  acTimer:      null,
+  acController: null,
 
-  acDebounce: null,         // autocomplete timer
-  acResults: [],
+  panelOpen:    null,   // 'stops' | null
+  drawerIdx:    null,   // which stop is in drawer
+
+  isGeocoding:  false,
+  geocodeCount: 0,
+  geocodeTotal: 0,
 };
 
-// ── BOOT ──────────────────────────────────────────────────
-document.addEventListener("DOMContentLoaded", () => {
+// ── BOOT ────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", async () => {
   initMap();
   bindUI();
   startGPS();
-  geocodeAll();
+  await geocodeAll();
+  runRoute();
+  openStopsPanel();            // show stops panel briefly on load
+  setTimeout(closeStopsPanel, CONFIG.ui.panelAutoHideMs);
 });
 
-// ── MAP ───────────────────────────────────────────────────
+// ── MAP INIT ────────────────────────────────────────────────────
 function initMap() {
-  const C = CONFIG.map;
-  State.map = L.map("map", {
-    worldCopyJump: true,
-    minZoom: C.minZoom,
-    maxZoom: C.maxZoom,
+  // Find default style
+  S.currentStyle = CONFIG.mapStyles.find(s => s.id === CONFIG.defaultMapStyle) || CONFIG.mapStyles[0];
+
+  S.map = L.map("map", {
     zoomControl: false,
-  }).setView(C.defaultCenter, C.defaultZoom);
+    attributionControl: true,
+    maxZoom: CONFIG.map.maxZoom,
+    minZoom: CONFIG.map.minZoom,
+    tap: true,
+  }).setView(CONFIG.map.defaultCenter, CONFIG.map.defaultZoom);
 
-  L.tileLayer(C.tileUrl, {
-    maxZoom: C.maxZoom,
-    attribution: C.tileAttribution,
-  }).addTo(State.map);
+  S.tileLayer = L.tileLayer(S.currentStyle.url, {
+    maxZoom: CONFIG.map.maxZoom,
+    attribution: S.currentStyle.attr,
+  }).addTo(S.map);
 
-  // Track zoom for 2D/3D feel label
-  State.map.on("zoom", updateZoomLabel);
+  // Build map style picker buttons
+  const picker = document.getElementById("style-picker-inner");
+  CONFIG.mapStyles.forEach(style => {
+    const btn = document.createElement("button");
+    btn.className = `style-btn${style.id === S.currentStyle.id ? " active" : ""}`;
+    btn.dataset.id = style.id;
+    btn.innerHTML = `<span class="style-btn-icon">${style.icon}</span>${style.name}`;
+    btn.addEventListener("click", () => switchMapStyle(style.id));
+    picker.appendChild(btn);
+  });
+
+  // Touch: 2-finger pinch/rotate for tilt toggle
+  let touchStart = null;
+  S.map.getContainer().addEventListener("touchstart", e => {
+    if (e.touches.length === 2) touchStart = getTouchMidpoint(e);
+  }, { passive: true });
+
+  S.map.getContainer().addEventListener("touchend", e => {
+    if (touchStart && e.changedTouches.length >= 1 && !e.touches.length) {
+      // two-finger swipe up = 3D, down = 2D
+    }
+    touchStart = null;
+  }, { passive: true });
+
+  // Two-finger vertical drag = tilt
+  let prevY = null;
+  S.map.getContainer().addEventListener("touchmove", e => {
+    if (e.touches.length !== 2) { prevY = null; return; }
+    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    if (prevY !== null) {
+      const dy = cy - prevY;
+      if (Math.abs(dy) > 12) {
+        setTilt(dy < 0); // swipe up = tilt (3D), swipe down = flat
+        prevY = null;
+      }
+    } else {
+      prevY = cy;
+    }
+  }, { passive: true });
+
+  S.map.on("dragstart", () => { if (S.followMode) { S.followMode = false; setFollowBtn(false); } });
 }
 
-function updateZoomLabel() {
-  const z = State.map.getZoom();
-  const el = document.getElementById("zoom-mode-label");
-  if (!el) return;
-  el.textContent = z >= CONFIG.map.flatZoomThreshold ? "Street" : "Overview";
+function getTouchMidpoint(e) {
+  return {
+    x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+    y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+  };
 }
 
-// ── GPS / GEOLOCATION ─────────────────────────────────────
+function switchMapStyle(id) {
+  const style = CONFIG.mapStyles.find(s => s.id === id);
+  if (!style || style.id === S.currentStyle.id) return;
+  S.currentStyle = style;
+  S.map.removeLayer(S.tileLayer);
+  S.tileLayer = L.tileLayer(style.url, { maxZoom: CONFIG.map.maxZoom, attribution: style.attr }).addTo(S.map);
+  S.tileLayer.bringToBack();
+  document.querySelectorAll(".style-btn").forEach(b => b.classList.toggle("active", b.dataset.id === id));
+  toggleStylePicker(false);
+  toast(`Map: ${style.name}`, "info");
+}
+
+function setTilt(on) {
+  S.tilt3d = on;
+  document.getElementById("map-tilt-wrapper").classList.toggle("tilted", on);
+  const fab = document.getElementById("fab-tilt");
+  fab?.classList.toggle("active", on);
+}
+
+// ── GPS ─────────────────────────────────────────────────────────
 function startGPS() {
-  if (!navigator.geolocation) {
-    toast("GPS not available on this device.", "warning");
-    return geocodeAll();
-  }
+  if (!navigator.geolocation) { toast("GPS not supported", "error"); return; }
 
-  // Quick single fix first
-  navigator.geolocation.getCurrentPosition(
-    onGPSUpdate,
-    () => {
-      // denied / failed — use default
-      State.map.setView(CONFIG.map.defaultCenter, CONFIG.map.defaultZoom);
-    },
-    { timeout: 8000, enableHighAccuracy: true }
-  );
-
-  // Then watch continuously
-  State.watchId = navigator.geolocation.watchPosition(
-    onGPSUpdate,
-    null,
-    { enableHighAccuracy: true, maximumAge: 2000 }
-  );
+  const opts = { enableHighAccuracy: true, maximumAge: 1500, timeout: 10000 };
+  navigator.geolocation.getCurrentPosition(onGPS, gpsErr, opts);
+  S.watchId = navigator.geolocation.watchPosition(onGPS, null, opts);
 }
 
-function onGPSUpdate(pos) {
+function onGPS(pos) {
   const { latitude: lat, longitude: lon, speed, heading } = pos.coords;
-  const first = !State.userLocation;
+  const first = S.userLat === null;
+  S.userLat = lat; S.userLon = lon;
+  S.userSpeed = Math.max(0, speed || 0);
+  S.userHeading = heading;
 
-  State.userLocation = { lat, lon };
-  State.userSpeed = speed || 0;
-  State.userHeading = heading;
-
+  updateUserMarker();
   updateSpeedHUD();
-  updateUserMarker(lat, lon, heading);
+  updateETAs();
 
   if (first) {
-    State.map.setView([lat, lon], CONFIG.map.defaultZoom);
-    updateDepotSelector();
-    // Trigger speed zone lookup
-    scheduleLookup();
+    S.map.setView([lat, lon], CONFIG.map.defaultZoom);
+    scheduleSpeedLookup();
   }
 
-  // Adaptive zoom: if user is within ~200m of active drop, zoom in
-  if (State.activeDropIdx !== null) {
-    const drop = State.dropOffs[State.activeDropIdx];
-    if (drop) {
-      const dist = haversine(lat, lon, drop.lat, drop.lon);
-      if (dist < 200 && State.map.getZoom() < CONFIG.map.nearZoom) {
-        State.map.flyTo([lat, lon], CONFIG.map.nearZoom, { duration: 1.2 });
-      } else if (dist >= 500 && State.map.getZoom() > CONFIG.map.farZoom) {
-        State.map.flyTo([lat, lon], CONFIG.map.farZoom, { duration: 1.2 });
-      }
+  if (S.followMode && S.activeIdx !== null) {
+    S.map.setView([lat, lon], CONFIG.map.followUserZoom);
+  } else if (S.followMode && first) {
+    S.map.setView([lat, lon], CONFIG.map.defaultZoom);
+  }
+
+  // Arrival check
+  if (S.activeIdx !== null) {
+    const stop = S.stops[S.activeIdx];
+    if (stop && !stop.done) {
+      const dist = haversine(lat, lon, stop.lat, stop.lon);
+      if (dist < CONFIG.map.arrivalRadiusM) showArrivingBanner(stop);
+      else hideArrivingBanner();
     }
   }
 }
 
-function updateUserMarker(lat, lon, heading) {
-  if (!State.userMarker) {
-    State.userMarker = L.marker([lat, lon], {
-      icon: makeUserIcon(heading),
-      zIndexOffset: 1000,
-    }).addTo(State.map);
+function gpsErr() { /* silent — use default center */ }
+
+function updateUserMarker() {
+  if (S.userLat === null) return;
+  const pos = [S.userLat, S.userLon];
+  if (!S.userMarker) {
+    const icon = L.divIcon({
+      html: `<div class="marker-emoji" style="filter:drop-shadow(0 0 6px rgba(0,212,255,0.8));">${CONFIG.icons.user}</div>`,
+      className: "", iconSize: [36,36], iconAnchor: [18,18],
+    });
+    S.userMarker = L.marker(pos, { icon, zIndexOffset: 2000 }).addTo(S.map);
   } else {
-    State.userMarker.setLatLng([lat, lon]);
-    State.userMarker.setIcon(makeUserIcon(heading));
+    S.userMarker.setLatLng(pos);
   }
 }
 
-function makeUserIcon(heading) {
-  const rot = heading != null ? heading : 0;
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
-    <circle cx="16" cy="16" r="14" fill="${CONFIG.markers.currentColor}" fill-opacity="0.25" stroke="${CONFIG.markers.currentColor}" stroke-width="2"/>
-    <circle cx="16" cy="16" r="7" fill="${CONFIG.markers.currentColor}" stroke="#fff" stroke-width="2"/>
-    ${heading != null ? `<polygon points="16,2 12,10 20,10" fill="${CONFIG.markers.currentColor}" transform="rotate(${rot},16,16)"/>` : ""}
-  </svg>`;
-  return L.divIcon({ html: svg, className: "", iconSize: [32,32], iconAnchor: [16,16] });
-}
-
-// ── SPEED HUD ─────────────────────────────────────────────
+// ── SPEED / ZONE ─────────────────────────────────────────────────
 function updateSpeedHUD() {
-  const speedEl  = document.getElementById("hud-speed");
-  const limitEl  = document.getElementById("hud-limit");
-  const unitsEl  = document.getElementById("hud-units");
-
-  if (!speedEl) return;
-
+  const kmh = S.userSpeed * 3.6;
   const isKmh = CONFIG.speed.units === "kmh";
-  const mps = State.userSpeed || 0;
-  const display = isKmh ? Math.round(mps * 3.6) : Math.round(mps * 2.237);
+  const display = Math.round(isKmh ? kmh : kmh * 0.621);
+  const unit = isKmh ? "km/h" : "mph";
 
-  speedEl.textContent = display;
-  if (unitsEl) unitsEl.textContent = isKmh ? "km/h" : "mph";
+  setEl("speed-num", display);
+  setEl("speed-unit", unit);
 
-  // Speed vs zone colour
-  const zone = State.zoneSpeedKmh || CONFIG.speed.defaultZoneSpeed;
-  const zoneDisplay = isKmh ? zone : Math.round(zone * 0.621);
+  const zone = S.zoneKmh || CONFIG.speed.defaultZoneKmh;
+  const zoneDisplay = Math.round(isKmh ? zone : zone * 0.621);
+  const over = zone && kmh > zone + 5;
+  const zoneEl = document.getElementById("speed-zone-num");
+  if (zoneEl) {
+    zoneEl.textContent = zoneDisplay;
+    zoneEl.classList.toggle("over", over);
+  }
 
-  if (limitEl) limitEl.textContent = zone ? `/ ${zoneDisplay}` : "";
-
-  // Colour warning
-  const overSpeed = zone && (mps * 3.6) > zone + 5;
-  speedEl.style.color = overSpeed ? "var(--red)" : "var(--text)";
+  const numEl = document.getElementById("speed-num");
+  if (numEl) numEl.style.color = over ? "var(--red)" : "var(--text)";
 }
 
-function scheduleLookup() {
-  if (State.speedLookupTimer) clearTimeout(State.speedLookupTimer);
-  const since = Date.now() - State.speedLookupLast;
-  const delay = Math.max(0, CONFIG.speed.updateIntervalMs - since);
-  State.speedLookupTimer = setTimeout(lookupZoneSpeed, delay);
+function scheduleSpeedLookup() {
+  clearTimeout(S.speedTimer);
+  S.speedTimer = setTimeout(lookupZoneSpeed, 500);
 }
 
 async function lookupZoneSpeed() {
-  if (!State.userLocation) return;
-  const { lat, lon } = State.userLocation;
+  if (S.userLat === null) return;
+  const { userLat: lat, userLon: lon } = S;
   const r = CONFIG.speed.lookupRadiusM;
-
-  const query = `[out:json][timeout:5];
-way(around:${r},${lat},${lon})[highway][maxspeed];
-out tags 1;`;
-
+  const q = `[out:json][timeout:5];way(around:${r},${lat},${lon})[highway][maxspeed];out tags 1;`;
   try {
     const res = await fetch(CONFIG.speed.overpassUrl, {
-      method: "POST",
-      body: "data=" + encodeURIComponent(query),
+      method: "POST", body: "data=" + encodeURIComponent(q),
+      signal: AbortSignal.timeout(5000),
     });
     const data = await res.json();
-    if (data.elements && data.elements[0]) {
+    if (data.elements?.[0]) {
       const raw = data.elements[0].tags.maxspeed || "";
-      const parsed = parseInt(raw);
-      if (!isNaN(parsed)) State.zoneSpeedKmh = parsed;
+      const n = parseInt(raw);
+      if (!isNaN(n)) { S.zoneKmh = n; updateSpeedHUD(); }
     }
-  } catch (_) {
-    // Overpass unavailable — keep previous / default
-  }
-
-  updateSpeedHUD();
-  State.speedLookupLast = Date.now();
-  scheduleLookup();
+  } catch (_) {}
+  S.speedTimer = setTimeout(lookupZoneSpeed, CONFIG.speed.intervalMs);
 }
 
-// ── GEOCODE ───────────────────────────────────────────────
+// ── GEOCODE ALL ──────────────────────────────────────────────────
 async function geocodeAddress(query) {
   const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) throw new Error("Geocode failed");
+  if (!res.ok) throw new Error();
   const data = await res.json();
   return data[0] || null;
 }
 
 async function geocodeAll() {
-  if (State.isGeocoding) return;
-  State.isGeocoding = true;
+  if (S.isGeocoding) return;
+  S.isGeocoding = true;
+  S.stops = []; S.depots = [];
+  const allAddrs = [...CONFIG.depots, ...CONFIG.dropOffs];
+  S.geocodeTotal = allAddrs.length;
+  S.geocodeCount = 0;
+  updateGeocodeProgress();
 
-  // Reset
-  State.depots = [];
-  State.dropOffs = [];
-
-  const allDrops  = [...CONFIG.dropOffs];
-  const allDepots = [...CONFIG.depots];
-
-  inlineLoader(true, `Geocoding ${allDrops.length + allDepots.length} addresses…`);
-
-  for (const addr of allDepots) {
-    await sleep(CONFIG.ui.geocodeDelay);
+  for (const cfg of CONFIG.depots) {
+    await sleep(CONFIG.ui.geocodeDelayMs);
     try {
-      const r = await geocodeAddress(addr);
-      if (r) State.depots.push({ name: addr, lat: parseFloat(r.lat), lon: parseFloat(r.lon) });
+      const r = await geocodeAddress(cfg.address);
+      if (r) S.depots.push({ ...cfg, lat: +r.lat, lon: +r.lon, marker: null });
     } catch (_) {}
+    S.geocodeCount++; updateGeocodeProgress();
   }
 
-  for (const addr of allDrops) {
-    await sleep(CONFIG.ui.geocodeDelay);
+  for (const cfg of CONFIG.dropOffs) {
+    await sleep(CONFIG.ui.geocodeDelayMs);
     try {
-      const r = await geocodeAddress(addr);
-      if (r) State.dropOffs.push({
-        name: addr,
-        lat: parseFloat(r.lat),
-        lon: parseFloat(r.lon),
-        done: false,
-        active: false,
-        marker: null,
-        zone: guessZone(addr),
-      });
+      const r = await geocodeAddress(cfg.address);
+      if (r) S.stops.push({ ...cfg, lat: +r.lat, lon: +r.lon, done: false, active: false, marker: null, etaMin: null, distM: null, order: 0 });
     } catch (_) {}
+    S.geocodeCount++; updateGeocodeProgress();
   }
 
-  inlineLoader(false);
-  State.isGeocoding = false;
-
+  S.isGeocoding = false;
   plotAllMarkers();
-  updateDepotSelector();
-  runOptimiseRoute();
 }
 
-// ── MARKERS ───────────────────────────────────────────────
-function makeIcon(color, label = "", size = 26) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
-    <circle cx="${size/2}" cy="${size/2}" r="${size/2-2}" fill="${color}" stroke="#0f172a" stroke-width="2"/>
-    ${label ? `<text x="50%" y="50%" dominant-baseline="central" text-anchor="middle" font-size="${size < 24 ? 8 : 10}" fill="#fff" font-family="monospace" font-weight="bold">${label}</text>` : ""}
-  </svg>`;
-  return L.divIcon({ html: svg, className: "", iconSize: [size,size], iconAnchor: [size/2,size/2], popupAnchor: [0,-size/2] });
+function updateGeocodeProgress() {
+  const el = document.getElementById("geocode-status");
+  if (!el) return;
+  if (S.geocodeCount >= S.geocodeTotal) { el.classList.add("hidden"); return; }
+  el.classList.remove("hidden");
+  el.textContent = `Geocoding ${S.geocodeCount}/${S.geocodeTotal}…`;
 }
 
-function makeDotIcon(color) {
-  // Small unobtrusive dot for drop-offs before activation
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">
-    <circle cx="7" cy="7" r="5" fill="${color}" stroke="#0f172a" stroke-width="2"/>
-  </svg>`;
-  return L.divIcon({ html: svg, className: "", iconSize: [14,14], iconAnchor: [7,7], popupAnchor: [0,-10] });
+// ── ROUTING (OSRM — always real roads) ───────────────────────────
+async function runRoute() {
+  const pending = S.stops.filter(s => !s.done);
+  if (!pending.length) return;
+
+  const start = getStart();
+  // Nearest-neighbour ordering first
+  const ordered = nearestNeighbour(start, pending);
+
+  // Then fetch OSRM for actual drive times across all stops
+  await fetchOSRMRoute(start, ordered);
+
+  S.route = [start, ...ordered];
+  renderRoutePolylines();
+  updateETAs();
+  renderStopsList();
+  updateTopBar();
 }
 
-function clearAllMapMarkers() {
-  State.dropOffs.forEach(d => { if (d.marker) { d.marker.remove(); d.marker = null; } });
-  State.depots.forEach(d => { if (d.marker) { d.marker.remove(); d.marker = null; } });
-  if (State.routeLayer) { State.routeLayer.remove(); State.routeLayer = null; }
+function getStart() {
+  if (S.userLat !== null) return { label: "Your Location", lat: S.userLat, lon: S.userLon };
+  if (S.depots.length) return S.depots[0];
+  return { label: "Start", lat: CONFIG.map.defaultCenter[0], lon: CONFIG.map.defaultCenter[1] };
 }
 
-function plotAllMarkers() {
-  clearAllMapMarkers();
-  const bounds = [];
-
-  // Depots
-  State.depots.forEach((d, i) => {
-    const m = L.marker([d.lat, d.lon], { icon: makeIcon(CONFIG.markers.homeColor, "D") })
-      .addTo(State.map)
-      .bindPopup(`<strong>🟢 Depot ${i+1}</strong><br>${d.name}`);
-    d.marker = m;
-    bounds.push([d.lat, d.lon]);
-  });
-
-  // Drop-offs: small amber dots until activated
-  State.dropOffs.forEach((d, i) => {
-    let icon;
-    if (d.done)        icon = makeDotIcon(CONFIG.markers.doneColor);
-    else if (d.active) icon = makeIcon(CONFIG.markers.dropActiveColor, String(i+1));
-    else               icon = makeDotIcon(CONFIG.markers.dropPendingColor);
-
-    const m = L.marker([d.lat, d.lon], { icon })
-      .addTo(State.map)
-      .on("click", () => openStopSheet(i));
-
-    d.marker = m;
-    bounds.push([d.lat, d.lon]);
-  });
-
-  if (State.userLocation) bounds.push([State.userLocation.lat, State.userLocation.lon]);
-
-  if (bounds.length > 1) {
-    State.map.fitBounds(L.latLngBounds(bounds).pad(0.12));
-  }
-
-  renderRouteList();
-  updateHeaderStats();
-}
-
-function refreshDropIcon(idx) {
-  const d = State.dropOffs[idx];
-  if (!d || !d.marker) return;
-  let icon;
-  if (d.done)        icon = makeDotIcon(CONFIG.markers.doneColor);
-  else if (d.active) icon = makeIcon(CONFIG.markers.dropActiveColor, String(idx+1));
-  else               icon = makeDotIcon(CONFIG.markers.dropPendingColor);
-  d.marker.setIcon(icon);
-}
-
-// ── BOTTOM SHEET — STOP DETAIL ─────────────────────────────
-function openStopSheet(idx) {
-  const d = State.dropOffs[idx];
-  if (!d) return;
-
-  const sheet  = document.getElementById("stop-sheet");
-  const bdrop  = document.getElementById("sheet-backdrop");
-  const title  = document.getElementById("sheet-title");
-  const meta   = document.getElementById("sheet-meta");
-  const btnGo  = document.getElementById("sheet-btn-go");
-  const btnDone= document.getElementById("sheet-btn-done");
-  const btnNav = document.getElementById("sheet-btn-nav");
-
-  title.textContent = d.name;
-  meta.innerHTML = `
-    <span class="status-chip ${d.done ? "done" : d.active ? "active" : "pending"}">
-      ${d.done ? "✅ Completed" : d.active ? "🔵 Navigating" : "⏳ Pending"}
-    </span>
-    ${d.zone ? `<span style="color:var(--muted);font-size:0.78rem;">· ${d.zone}</span>` : ""}
-  `;
-
-  btnGo.style.display  = (!d.done && !d.active) ? "flex" : "none";
-  btnDone.style.display= (!d.done) ? "flex" : "none";
-  btnNav.style.display = (d.active || d.done) ? "flex" : "none";
-  if (d.done) { btnNav.textContent = "↩ Reopen"; }
-  else        { btnNav.textContent = "🗺 Open in Maps"; }
-
-  // Wire buttons
-  btnGo.onclick = () => { activateStop(idx); closeSheet(); };
-  btnDone.onclick = () => { markDone(idx); closeSheet(); };
-  btnNav.onclick = () => {
-    if (d.done) { reopenStop(idx); closeSheet(); }
-    else openExternalNav(d);
-  };
-
-  sheet.classList.add("open");
-  bdrop.classList.add("open");
-}
-
-function closeSheet() {
-  document.getElementById("stop-sheet").classList.remove("open");
-  document.getElementById("sheet-backdrop").classList.remove("open");
-}
-
-function openExternalNav(d) {
-  const url = `https://www.google.com/maps/dir/?api=1&destination=${d.lat},${d.lon}&travelmode=driving`;
-  window.open(url, "_blank");
-}
-
-// ── STOP ACTIVATION ───────────────────────────────────────
-function activateStop(idx) {
-  // Deactivate any previous
-  if (State.activeDropIdx !== null && State.activeDropIdx !== idx) {
-    State.dropOffs[State.activeDropIdx].active = false;
-    refreshDropIcon(State.activeDropIdx);
-  }
-
-  const d = State.dropOffs[idx];
-  d.active = true;
-  State.activeDropIdx = idx;
-  refreshDropIcon(idx);
-
-  // Fly to the stop
-  State.map.flyTo([d.lat, d.lon], CONFIG.map.nearZoom, { duration: CONFIG.map.flyDuration });
-
-  // Draw route to this stop from user / depot
-  drawRouteToStop(idx);
-  renderRouteList();
-  toast(`Navigating to: ${shortName(d.name)}`, "success");
-}
-
-function markDone(idx) {
-  const d = State.dropOffs[idx];
-  d.done   = true;
-  d.active = false;
-  if (State.activeDropIdx === idx) State.activeDropIdx = null;
-  refreshDropIcon(idx);
-  renderRouteList();
-  updateHeaderStats();
-  updateLoadBar();
-  toast(`✅ Done: ${shortName(d.name)}`, "success");
-}
-
-function reopenStop(idx) {
-  const d = State.dropOffs[idx];
-  d.done = false;
-  refreshDropIcon(idx);
-  renderRouteList();
-  updateHeaderStats();
-  updateLoadBar();
-  toast(`↩ Reopened: ${shortName(d.name)}`, "warning");
-}
-
-function markAllDone() {
-  State.dropOffs.forEach((d, i) => { d.done = true; d.active = false; });
-  State.activeDropIdx = null;
-  plotAllMarkers();
-  updateHeaderStats();
-  updateLoadBar();
-  toast("All stops marked done!", "success");
-}
-
-// ── ROUTE OPTIMISATION ────────────────────────────────────
-function haversine(lat1, lon1, lat2, lon2) {
-  const R = 6371000;
-  const dLat = (lat2-lat1)*Math.PI/180;
-  const dLon = (lon2-lon1)*Math.PI/180;
-  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-}
-
-function getDistance(a, b) {
-  return haversine(a.lat, a.lon, b.lat, b.lon);
-}
-
-function optimiseRoute(start, stops) {
-  const route = [start];
+function nearestNeighbour(start, stops) {
+  const route = [];
   let remaining = [...stops];
-  let current = start;
+  let cur = start;
   while (remaining.length) {
-    let ci = 0, cd = Infinity;
-    remaining.forEach((s, i) => { const d = getDistance(current, s); if (d < cd) { cd = d; ci = i; } });
-    current = remaining.splice(ci, 1)[0];
-    route.push(current);
+    let bi = 0, bd = Infinity;
+    remaining.forEach((s, i) => { const d = haversine(cur.lat, cur.lon, s.lat, s.lon); if (d < bd) { bd = d; bi = i; } });
+    cur = remaining.splice(bi, 1)[0];
+    route.push(cur);
   }
   return route;
 }
 
-function runOptimiseRoute() {
-  const pending = State.dropOffs.filter(d => !d.done);
-  const start = getRouteStart();
-  State.route = optimiseRoute(start, pending);
-  drawRoute(State.route);
-  renderRouteList();
-  updateHeaderStats();
-}
+async function fetchOSRMRoute(start, stops) {
+  if (!stops.length) return;
+  const allPts = [start, ...stops];
+  const coords = allPts.map(p => `${p.lon},${p.lat}`).join(";");
+  const url = `${CONFIG.route.osrmBase}${coords}?overview=full&geometries=geojson&annotations=duration,distance&steps=false`;
 
-function getRouteStart() {
-  if (State.selectedDepotIdx === 0 && State.userLocation)
-    return { name: "Your Location", ...State.userLocation };
-  if (State.depots.length)
-    return State.depots[Math.max(0, State.selectedDepotIdx - 1)] || State.depots[0];
-  if (State.userLocation)
-    return { name: "Your Location", ...State.userLocation };
-  return { name: "Start", lat: CONFIG.map.defaultCenter[0], lon: CONFIG.map.defaultCenter[1] };
-}
+  clearRoutePolylines();
 
-async function drawRoute(route) {
-  if (State.routeLayer) { State.routeLayer.remove(); State.routeLayer = null; }
-  if (route.length < 2) return;
-  const C = CONFIG.route;
-  if (C.useRealRoads) {
-    await drawOSRMRoute(route);
-  } else {
-    State.routeLayer = L.polyline(route.map(p => [p.lat, p.lon]), {
-      color: C.color, weight: C.weight, opacity: C.opacity, dashArray: C.dashArray,
-    }).addTo(State.map);
-  }
-}
-
-async function drawRouteToStop(idx) {
-  if (State.routeLayer) { State.routeLayer.remove(); State.routeLayer = null; }
-  const start = getRouteStart();
-  const stop  = State.dropOffs[idx];
-  const seg   = [start, stop];
-  if (CONFIG.route.useRealRoads) await drawOSRMRoute(seg);
-  else {
-    State.routeLayer = L.polyline(seg.map(p => [p.lat, p.lon]), {
-      color: CONFIG.route.color, weight: CONFIG.route.weight, opacity: CONFIG.route.opacity,
-    }).addTo(State.map);
-  }
-}
-
-async function drawOSRMRoute(route) {
-  const coords = route.map(p => `${p.lon},${p.lat}`).join(";");
-  const url = `${CONFIG.route.osrmBase}${coords}?overview=full&geometries=geojson`;
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
     const data = await res.json();
-    if (data.routes?.[0]) {
-      State.routeLayer = L.geoJSON(data.routes[0].geometry, {
-        style: { color: CONFIG.route.color, weight: CONFIG.route.weight, opacity: CONFIG.route.opacity },
-      }).addTo(State.map);
-      return;
+    if (!data.routes?.[0]) throw new Error("no route");
+
+    const osrmRoute = data.routes[0];
+    const legs = osrmRoute.legs;
+
+    // Assign cumulative ETA to each stop
+    let cumSecs = 0;
+    stops.forEach((stop, i) => {
+      const leg = legs[i];
+      cumSecs += (leg?.duration || 0) + CONFIG.van.dwellMinutes * 60;
+      stop.etaMin  = Math.round(cumSecs / 60);
+      stop.distM   = legs.slice(0, i+1).reduce((acc, l) => acc + (l?.distance || 0), 0);
+      stop.order   = i + 1;
+    });
+
+    // Draw full route geometry
+    if (osrmRoute.geometry) {
+      const layer = L.geoJSON(osrmRoute.geometry, {
+        style: { color: CONFIG.route.activeColor, weight: CONFIG.route.lineWeight, opacity: CONFIG.route.lineOpacity },
+      }).addTo(S.map);
+      S.routeLayers.push(layer);
     }
-  } catch (_) {}
-  // Fallback
-  State.routeLayer = L.polyline(route.map(p => [p.lat, p.lon]), {
-    color: CONFIG.route.color, weight: CONFIG.route.weight,
-  }).addTo(State.map);
+  } catch (_) {
+    // Fallback straight lines
+    const pts = allPts.map(p => [p.lat, p.lon]);
+    const layer = L.polyline(pts, {
+      color: CONFIG.route.plannedColor, weight: CONFIG.route.lineWeight, opacity: 0.5, dashArray: "6 4",
+    }).addTo(S.map);
+    S.routeLayers.push(layer);
+
+    // Estimate ETAs by crow-fly + avg speed
+    let cumSecs = 0;
+    stops.forEach((stop, i) => {
+      const prev = i === 0 ? start : stops[i-1];
+      const d = haversine(prev.lat, prev.lon, stop.lat, stop.lon);
+      const secs = (d / (CONFIG.van.avgSpeedKmh / 3.6)) + CONFIG.van.dwellMinutes * 60;
+      cumSecs += secs;
+      stop.etaMin = Math.round(cumSecs / 60);
+      stop.distM  = d;
+      stop.order  = i + 1;
+    });
+  }
 }
 
-// ── SIDEBAR ───────────────────────────────────────────────
-function renderRouteList() {
-  const el = document.getElementById("route-list");
-  if (!el) return;
+function clearRoutePolylines() {
+  S.routeLayers.forEach(l => l.remove());
+  S.routeLayers = [];
+}
 
-  if (State.route.length === 0 && State.dropOffs.length === 0) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🗺️</div>Geocoding stops…</div>`;
+function renderRoutePolylines() { /* handled inside fetchOSRMRoute */ }
+
+// ── MARKERS ──────────────────────────────────────────────────────
+function plotAllMarkers() {
+  // Remove old
+  S.stops.forEach(s => { if (s.marker) { s.marker.remove(); s.marker = null; } });
+  S.depots.forEach(d => { if (d.marker) { d.marker.remove(); d.marker = null; } });
+
+  S.depots.forEach(d => {
+    const icon = L.divIcon({
+      html: `<div class="marker-emoji">${CONFIG.icons.depot}</div>`,
+      className: "", iconSize: [30,30], iconAnchor: [15,15],
+    });
+    d.marker = L.marker([d.lat, d.lon], { icon })
+      .addTo(S.map)
+      .bindPopup(`<strong>${CONFIG.icons.depot} ${d.label}</strong><br>${d.address}`);
+  });
+
+  S.stops.forEach((stop, i) => {
+    refreshStopMarker(i);
+  });
+
+  // Fit bounds
+  const allPts = [...S.stops, ...S.depots, ...(S.userLat !== null ? [{ lat: S.userLat, lon: S.userLon }] : [])];
+  if (allPts.length > 1) {
+    try { S.map.fitBounds(L.latLngBounds(allPts.map(p => [p.lat, p.lon])).pad(0.1)); } catch (_) {}
+  }
+}
+
+function refreshStopMarker(idx) {
+  const stop = S.stops[idx];
+  if (!stop) return;
+  if (stop.marker) stop.marker.remove();
+
+  const emoji = stop.done ? CONFIG.icons.dropDone : stop.active ? CONFIG.icons.dropActive : CONFIG.icons.dropOff;
+  const cls   = stop.done ? "stop-done" : stop.active ? "stop-active" : "";
+  const etaStr = stop.etaMin != null ? fmtETA(stop.etaMin) : "";
+
+  const html = `
+    <div style="position:relative;width:34px;height:34px;">
+      <div class="marker-stop ${cls}">${stop.order || idx+1}</div>
+      ${etaStr ? `<div class="eta-badge">${etaStr}</div>` : ""}
+    </div>`;
+
+  const icon = L.divIcon({ html, className: "", iconSize: [34,34], iconAnchor: [17,17], popupAnchor: [0,-20] });
+  stop.marker = L.marker([stop.lat, stop.lon], { icon })
+    .addTo(S.map)
+    .on("click", () => openStopDrawer(idx));
+}
+
+function refreshAllStopMarkers() {
+  S.stops.forEach((_, i) => refreshStopMarker(i));
+}
+
+// ── STOP DRAWER ───────────────────────────────────────────────────
+function openStopDrawer(idx) {
+  const stop = S.stops[idx];
+  if (!stop) return;
+  S.drawerIdx = idx;
+  closeStopsPanel();
+
+  const emoji = stop.done ? CONFIG.icons.dropDone : stop.active ? CONFIG.icons.dropActive : CONFIG.icons.dropOff;
+  setEl("drawer-emoji", emoji);
+  setEl("drawer-name", stop.label || stop.address.split(",")[0]);
+  setEl("drawer-addr", stop.address);
+
+  // Status chip
+  const metaEl = document.getElementById("drawer-meta");
+  const etaStr = stop.etaMin != null ? `ETA ${fmtETA(stop.etaMin)}` : "";
+  metaEl.innerHTML = `
+    <span class="meta-chip ${stop.done ? "done" : stop.active ? "active" : "pending"}">
+      ${stop.done ? "✅ Done" : stop.active ? "🔵 Navigating" : "⏳ Pending"}
+    </span>
+    ${etaStr ? `<span class="meta-chip eta">🕐 ${etaStr}</span>` : ""}
+    ${stop.distM ? `<span class="meta-chip eta">📏 ${fmtDist(stop.distM)}</span>` : ""}
+  `;
+
+  // Button visibility
+  document.getElementById("drawer-btn-go").style.display   = (!stop.done && !stop.active) ? "" : "none";
+  document.getElementById("drawer-btn-done").style.display = !stop.done ? "" : "none";
+  document.getElementById("drawer-btn-reopen").style.display = stop.done ? "" : "none";
+  document.getElementById("drawer-btn-nav").style.display  = !stop.done ? "" : "none";
+
+  document.getElementById("stop-drawer").classList.add("open");
+  document.getElementById("sheet-backdrop").classList.add("open");
+
+  // Fly to stop
+  S.map.flyTo([stop.lat, stop.lon], 15, { duration: 0.8 });
+}
+
+function closeStopDrawer() {
+  document.getElementById("stop-drawer").classList.remove("open");
+  document.getElementById("sheet-backdrop").classList.remove("open");
+  S.drawerIdx = null;
+}
+
+// ── STOP ACTIONS ──────────────────────────────────────────────────
+function goToStop(idx) {
+  if (idx == null) idx = S.drawerIdx;
+  if (idx == null) return;
+  const stop = S.stops[idx];
+  if (!stop) return;
+
+  // Deactivate previous
+  S.stops.forEach(s => { s.active = false; });
+  stop.active = true;
+  S.activeIdx = idx;
+  S.followMode = true;
+  setFollowBtn(true);
+
+  closeStopDrawer();
+  refreshAllStopMarkers();
+  renderStopsList();
+  updateTopBar();
+
+  // Redraw route from user to this stop then remaining
+  redrawActiveRoute();
+  toast(`Navigating to ${stop.label || stop.address.split(",")[0]}`, "info");
+}
+
+async function redrawActiveRoute() {
+  clearRoutePolylines();
+  if (S.activeIdx === null) return;
+
+  const remaining = S.stops.filter(s => !s.done);
+  const activeStop = S.stops[S.activeIdx];
+  if (!activeStop) return;
+
+  const start = getStart();
+  const reordered = [activeStop, ...remaining.filter(s => s !== activeStop)];
+  await fetchOSRMRoute(start, reordered);
+  refreshAllStopMarkers();
+  renderStopsList();
+}
+
+function markDone(idx) {
+  if (idx == null) idx = S.drawerIdx;
+  if (idx == null) return;
+  const stop = S.stops[idx];
+  if (!stop) return;
+  stop.done = true; stop.active = false;
+  if (S.activeIdx === idx) S.activeIdx = null;
+  hideArrivingBanner();
+  closeStopDrawer();
+  refreshStopMarker(idx);
+  renderStopsList();
+  updateTopBar();
+  updateLoadBar();
+  toast(`✅ ${stop.label || "Stop"} complete`, "success");
+
+  // Auto-advance to next pending
+  const next = S.stops.find(s => !s.done && !s.active);
+  if (next) {
+    const ni = S.stops.indexOf(next);
+    setTimeout(() => goToStop(ni), 700);
+  } else {
+    updateTopBar();
+    toast("🎉 All stops done!", "success");
+  }
+}
+
+function reopenStop(idx) {
+  if (idx == null) idx = S.drawerIdx;
+  if (idx == null) return;
+  S.stops[idx].done = false;
+  closeStopDrawer();
+  refreshStopMarker(idx);
+  renderStopsList();
+  updateTopBar();
+  toast("Stop reopened", "warning");
+}
+
+// ── UI RENDERING ─────────────────────────────────────────────────
+function updateTopBar() {
+  const active = S.activeIdx !== null ? S.stops[S.activeIdx] : null;
+  const destCard = document.getElementById("dest-card");
+  if (!active) {
+    destCard?.classList.add("hidden-card");
     return;
   }
-
-  el.innerHTML = "";
-
-  State.route.forEach((stop, idx) => {
-    const isStart = idx === 0;
-    const dropIdx = State.dropOffs.findIndex(d => d.name === stop.name && d.lat === stop.lat);
-    const d = dropIdx >= 0 ? State.dropOffs[dropIdx] : null;
-    const done   = d?.done   || false;
-    const active = d?.active || false;
-
-    const badgeColor = isStart ? "depot" : done ? "done" : active ? "drop" : "pending";
-    const badge = isStart ? "S" : done ? "✓" : String(idx);
-
-    const item = document.createElement("div");
-    item.className = `route-item${done ? " done" : ""}${active ? " active-stop" : ""}`;
-    item.innerHTML = `
-      <div class="route-badge ${badgeColor}">${badge}</div>
-      <div class="route-info">
-        <div class="route-name">${stop.name}</div>
-        <div class="route-meta">${isStart ? "START" : done ? "Completed" : active ? "Navigating ↗" : `Stop #${idx}`}${stop.zone ? ` · ${stop.zone}` : ""}</div>
-      </div>
-      <div class="route-actions">
-        ${!isStart && dropIdx >= 0 ? `
-          <button class="btn btn-icon ${done ? "btn-secondary" : "btn-success"}" onclick="event.stopPropagation();${done ? `reopenStop(${dropIdx})` : `markDone(${dropIdx})`}" title="${done ? "Reopen" : "Done"}">
-            ${done ? "↩" : "✓"}
-          </button>
-          ${!done ? `<button class="btn btn-icon btn-primary" onclick="event.stopPropagation();activateStop(${dropIdx})" title="Go to">↗</button>` : ""}
-        ` : ""}
-      </div>
-    `;
-    item.addEventListener("click", () => {
-      if (isStart) return;
-      State.map.flyTo([stop.lat, stop.lon], 15, { duration: 0.8 });
-    });
-    el.appendChild(item);
-  });
-
-  // Progress
-  const total = State.dropOffs.length;
-  const done  = State.dropOffs.filter(d => d.done).length;
-  const pct   = total ? Math.round((done/total)*100) : 0;
-  const prog  = document.getElementById("progress-row");
-  if (prog) prog.innerHTML = `
-    <div class="progress-pct">${pct}%</div>
-    <div class="progress-info">
-      <div>${done} of ${total} stops complete</div>
-      <div class="progress-label">${total-done} remaining</div>
-    </div>
-  `;
+  destCard?.classList.remove("hidden-card");
+  setEl("dest-name", active.label || active.address.split(",")[0]);
+  setEl("dest-addr", active.address);
+  setEl("dest-eta-time", active.etaMin != null ? fmtETA(active.etaMin) : "--");
+  setEl("dest-dist", active.distM ? fmtDist(active.distM) : "");
 }
 
-function updateDepotSelector() {
-  const el = document.getElementById("depot-selector");
+function renderStopsList() {
+  const el = document.getElementById("stops-list");
   if (!el) return;
   el.innerHTML = "";
-  const opts = [
-    { label: State.userLocation ? "📍 Your Location" : "📍 Current Location", idx: 0 },
-    ...State.depots.map((d, i) => ({ label: `🟢 ${shortName(d.name)}`, idx: i+1 })),
-  ];
-  opts.forEach(({ label, idx }) => {
-    const div = document.createElement("div");
-    div.className = `depot-option${State.selectedDepotIdx === idx ? " selected" : ""}`;
-    div.innerHTML = `<div class="dot-green"></div><div class="depot-option-name">${label}</div>`;
-    div.addEventListener("click", () => { State.selectedDepotIdx = idx; updateDepotSelector(); });
-    el.appendChild(div);
+
+  const total = S.stops.length;
+  const done  = S.stops.filter(s => s.done).length;
+  const pct   = total ? Math.round(done/total*100) : 0;
+
+  setEl("panel-stat-total",   total);
+  setEl("panel-stat-done",    done);
+  setEl("panel-stat-pending", total - done);
+  const fill = document.getElementById("panel-progress-fill");
+  if (fill) fill.style.width = `${pct}%`;
+
+  // Sort: active first, then pending by order, then done
+  const sorted = [...S.stops].sort((a, b) => {
+    if (a.active && !b.active) return -1;
+    if (!a.active && b.active) return 1;
+    if (a.done !== b.done) return a.done ? 1 : -1;
+    return (a.order || 999) - (b.order || 999);
+  });
+
+  sorted.forEach(stop => {
+    const origIdx = S.stops.indexOf(stop);
+    const row = document.createElement("div");
+    const cls = stop.done ? "done-row" : stop.active ? "active-row" : "";
+    row.className = `stop-row ${cls}`;
+
+    const numCls = stop.done ? "n-done" : stop.active ? "n-active" : "n-pending";
+    const numLabel = stop.done ? "✓" : String(stop.order || origIdx+1);
+    const etaStr = stop.etaMin != null ? `ETA ${fmtETA(stop.etaMin)}` : (stop.distM ? fmtDist(stop.distM) : "");
+
+    row.innerHTML = `
+      <div class="stop-row-num ${numCls}">${numLabel}</div>
+      <div class="stop-row-info">
+        <div class="stop-row-name">${stop.label || stop.address.split(",")[0]}</div>
+        <div class="stop-row-eta">${etaStr}</div>
+      </div>
+      <div class="stop-row-action">
+        ${!stop.done ? `<button class="btn btn-sm btn-go" onclick="event.stopPropagation();goToStop(${origIdx})">↗</button>` : ""}
+        ${!stop.done ? `<button class="btn btn-sm btn-done" onclick="event.stopPropagation();markDone(${origIdx})">✓</button>` : `<button class="btn btn-sm btn-skip" onclick="event.stopPropagation();reopenStop(${origIdx})">↩</button>`}
+      </div>
+    `;
+    row.addEventListener("click", () => openStopDrawer(origIdx));
+    el.appendChild(row);
   });
 }
 
-function updateHeaderStats() {
-  const total   = State.dropOffs.length;
-  const done    = State.dropOffs.filter(d => d.done).length;
-  setEl("stat-total",   total);
-  setEl("stat-done",    done);
-  setEl("stat-pending", total - done);
-  setEl("stat-depots",  State.depots.length);
+function updateETAs() {
+  // Recalculate based on GPS position
+  if (S.userLat === null || !S.route.length) return;
+  const pending = S.stops.filter(s => !s.done);
+  if (!pending.length) return;
+
+  // Use GPS speed or config avg
+  const speedKmh = S.userSpeed > 0.5 ? S.userSpeed * 3.6 : CONFIG.van.avgSpeedKmh;
+  let cur = { lat: S.userLat, lon: S.userLon };
+  let cumMin = 0;
+
+  S.route.slice(1).forEach(stop => {
+    if (!stop || stop.done) return;
+    const d = haversine(cur.lat, cur.lon, stop.lat, stop.lon);
+    cumMin += (d / (speedKmh / 3.6)) / 60 + CONFIG.van.dwellMinutes;
+    stop.etaMin = Math.round(cumMin);
+    stop.distM  = d;
+    cur = stop;
+  });
+
+  updateTopBar();
+  // Update eta badges on markers
+  S.stops.forEach((s, i) => { if (s.marker && !s.done) refreshStopMarker(i); });
 }
 
 function updateLoadBar() {
-  const delivered = State.dropOffs.filter(d => d.done).length;
-  const cap = CONFIG.van.capacity;
-  const pct = Math.min(100, Math.round((delivered/cap)*100));
-  const fill = document.getElementById("load-fill");
-  const label= document.getElementById("load-label");
-  if (!fill) return;
-  fill.style.width = `${pct}%`;
-  fill.classList.toggle("warn", (cap - delivered) <= CONFIG.van.warnAt);
-  if (label) label.textContent = `${delivered} / ${cap} bins`;
+  const done = S.stops.filter(s => s.done).length;
+  const cap  = CONFIG.van.capacity;
+  const pct  = Math.min(100, Math.round(done/cap*100));
+  const el   = document.getElementById("load-fill");
+  if (el) el.style.width = `${pct}%`;
 }
 
-// ── AUTOCOMPLETE ──────────────────────────────────────────
-async function fetchSuggestions(query) {
-  const C = CONFIG.autocomplete;
-  const cc = C.countryCode ? `&countrycodes=${C.countryCode}` : "";
-  const url = `${C.nominatimUrl}?format=jsonv2&limit=${C.maxResults}&q=${encodeURIComponent(query)}${cc}`;
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) return [];
-  return await res.json();
-}
-
-function bindAutocomplete(inputId, listId, onSelect) {
-  const input = document.getElementById(inputId);
-  const list  = document.getElementById(listId);
-  if (!input || !list) return;
+// ── AUTOCOMPLETE ──────────────────────────────────────────────────
+function initSearchAutocomplete() {
+  const input = document.getElementById("search-input");
+  const drop  = document.getElementById("search-ac");
+  if (!input || !drop) return;
 
   input.addEventListener("input", () => {
     const val = input.value.trim();
-    clearTimeout(State.acDebounce);
-    if (val.length < CONFIG.autocomplete.minChars) { list.classList.add("hidden"); return; }
-    State.acDebounce = setTimeout(async () => {
-      const results = await fetchSuggestions(val);
-      renderSuggestions(results, list, input, onSelect);
-    }, CONFIG.autocomplete.debounceMs);
+    document.getElementById("search-clear").classList.toggle("hidden", !val);
+    clearTimeout(S.acTimer);
+    if (val.length < CONFIG.autocomplete.minChars) { drop.classList.add("hidden"); return; }
+    drop.innerHTML = `<div class="ac-loading"><div class="spinner"></div> Searching…</div>`;
+    drop.classList.remove("hidden");
+    S.acTimer = setTimeout(() => doAutocomplete(val, drop, input), CONFIG.autocomplete.debounceMs);
   });
 
-  // Close on outside click
-  document.addEventListener("click", (e) => {
-    if (!input.contains(e.target) && !list.contains(e.target)) list.classList.add("hidden");
+  document.getElementById("search-clear")?.addEventListener("click", () => {
+    input.value = "";
+    drop.classList.add("hidden");
+    document.getElementById("search-clear").classList.add("hidden");
+  });
+
+  document.addEventListener("click", e => {
+    if (!input.contains(e.target) && !drop.contains(e.target)) drop.classList.add("hidden");
   });
 }
 
-function renderSuggestions(results, list, input, onSelect) {
-  list.innerHTML = "";
-  if (!results.length) { list.classList.add("hidden"); return; }
-  results.forEach(r => {
-    const li = document.createElement("div");
-    li.className = "ac-item";
-    li.textContent = r.display_name;
-    li.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      input.value = r.display_name;
-      list.classList.add("hidden");
-      onSelect(r);
-    });
-    list.appendChild(li);
-  });
-  list.classList.remove("hidden");
-}
+async function doAutocomplete(query, drop, input) {
+  if (S.acController) S.acController.abort();
+  S.acController = new AbortController();
+  const cc = CONFIG.autocomplete.countryCode ? `&countrycodes=${CONFIG.autocomplete.countryCode}` : "";
+  const url = `${CONFIG.autocomplete.url}?format=jsonv2&limit=${CONFIG.autocomplete.maxResults}&addressdetails=1&q=${encodeURIComponent(query)}${cc}`;
 
-// ── DEPOT ADDING ──────────────────────────────────────────
-async function addDepotFromInput() {
-  const input = document.getElementById("input-add-depot");
-  const val   = input.value.trim();
-  if (!val) return;
-  input.value = "";
-  document.getElementById("depot-ac-list")?.classList.add("hidden");
-  inlineLoader(true, "Adding depot…");
   try {
-    const r = await geocodeAddress(val);
-    if (!r) { toast("Could not find that address.", "error"); }
-    else {
-      State.depots.push({ name: val, lat: parseFloat(r.lat), lon: parseFloat(r.lon), marker: null });
-      plotAllMarkers();
-      updateDepotSelector();
-      runOptimiseRoute();
-      toast(`Depot added: ${shortName(val)}`, "success");
-    }
-  } catch (_) { toast("Geocoding failed.", "error"); }
-  inlineLoader(false);
-}
-
-// ── RECENTER ──────────────────────────────────────────────
-function recenter() {
-  if (!State.userLocation) { toast("Waiting for GPS fix…", "warning"); return; }
-  const { lat, lon } = State.userLocation;
-  // If zoomed in close: go overview. If already overview: zoom close.
-  const current = State.map.getZoom();
-  const target  = current >= CONFIG.map.flatZoomThreshold ? CONFIG.map.farZoom : CONFIG.map.nearZoom;
-  State.map.flyTo([lat, lon], target, { duration: 0.9 });
-}
-
-// ── UI BINDING ────────────────────────────────────────────
-function bindUI() {
-  // Tabs
-  document.querySelectorAll(".tab-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const panel = btn.dataset.tab;
-      document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
-      btn.classList.add("active");
-      document.getElementById(panel)?.classList.add("active");
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" },
+      signal: S.acController.signal,
     });
-  });
-
-  // Sheet backdrop close
-  document.getElementById("sheet-backdrop")?.addEventListener("click", closeSheet);
-  document.getElementById("sheet-close")?.addEventListener("click", closeSheet);
-
-  // Recenter FAB
-  document.getElementById("fab-recenter")?.addEventListener("click", recenter);
-
-  // Fit bounds FAB
-  document.getElementById("fab-fit")?.addEventListener("click", () => {
-    const pts = [...State.depots, ...State.dropOffs, ...(State.userLocation ? [State.userLocation] : [])];
-    if (!pts.length) return;
-    State.map.fitBounds(L.latLngBounds(pts.map(p => [p.lat, p.lon])).pad(0.12));
-  });
-
-  // Optimise
-  document.getElementById("btn-optimise")?.addEventListener("click", runOptimiseRoute);
-  document.getElementById("btn-recalc")?.addEventListener("click", () => {
-    State.dropOffs.forEach(d => { d.done = false; d.active = false; });
-    State.activeDropIdx = null;
-    plotAllMarkers();
-    runOptimiseRoute();
-    toast("Route recalculated.", "success");
-  });
-  document.getElementById("btn-mark-all")?.addEventListener("click", markAllDone);
-
-  // Depot add
-  document.getElementById("btn-add-depot")?.addEventListener("click", addDepotFromInput);
-  document.getElementById("input-add-depot")?.addEventListener("keydown", e => {
-    if (e.key === "Enter") addDepotFromInput();
-  });
-
-  // Depot autocomplete
-  bindAutocomplete("input-add-depot", "depot-ac-list", (r) => {
-    document.getElementById("input-add-depot").value = r.display_name;
-  });
-
-  // Settings
-  document.getElementById("toggle-real-roads")?.addEventListener("change", (e) => {
-    CONFIG.route.useRealRoads = e.target.checked;
-    if (State.route.length > 0) drawRoute(State.route);
-  });
-
-  document.getElementById("toggle-autosave")?.addEventListener("change", (e) => {
-    CONFIG.storage.autoSave = e.target.checked;
-  });
-
-  document.getElementById("input-capacity")?.addEventListener("change", (e) => {
-    const v = parseInt(e.target.value);
-    if (!isNaN(v) && v > 0) { CONFIG.van.capacity = v; updateLoadBar(); }
-  });
-
-  document.getElementById("input-speed-units")?.addEventListener("change", (e) => {
-    CONFIG.speed.units = e.target.value;
-    updateSpeedHUD();
-  });
-
-  document.getElementById("input-route-color")?.addEventListener("input", (e) => {
-    CONFIG.route.color = e.target.value;
-    if (State.routeLayer) State.routeLayer.setStyle({ color: e.target.value });
-  });
-
-  updateLoadBar();
-  updateHeaderStats();
+    const results = await res.json();
+    renderACResults(results, drop, input);
+  } catch (e) {
+    if (e.name !== "AbortError") drop.classList.add("hidden");
+  }
 }
 
-// ── HELPERS ───────────────────────────────────────────────
+function renderACResults(results, drop, input) {
+  drop.innerHTML = "";
+  if (!results.length) {
+    drop.innerHTML = `<div class="ac-loading" style="color:var(--text-3)">No results found</div>`;
+    return;
+  }
+  results.forEach(r => {
+    const primary   = r.namedetails?.name || r.address?.road || r.display_name.split(",")[0];
+    const secondary = r.display_name.replace(primary + ", ", "").substring(0, 60);
+    const typeIcon  = getLocationIcon(r.type, r.class);
+
+    const item = document.createElement("div");
+    item.className = "ac-item";
+    item.innerHTML = `
+      <div class="ac-item-icon">${typeIcon}</div>
+      <div class="ac-item-text">
+        <div class="ac-item-primary">${primary}</div>
+        <div class="ac-item-secondary">${secondary}</div>
+      </div>`;
+    item.addEventListener("mousedown", e => e.preventDefault());
+    item.addEventListener("click", () => {
+      input.value = r.display_name;
+      drop.classList.add("hidden");
+      // Fly to result
+      const lat = +r.lat, lon = +r.lon;
+      S.map.flyTo([lat, lon], 16, { duration: 1 });
+      S.followMode = false; setFollowBtn(false);
+    });
+    drop.appendChild(item);
+  });
+}
+
+function getLocationIcon(type, cls) {
+  const map = {
+    "house": "🏠", "road": "🛣", "suburb": "🏘", "city": "🏙",
+    "restaurant": "🍽", "shop": "🛍", "hospital": "🏥",
+    "school": "🏫", "park": "🌳", "fuel": "⛽",
+    "pharmacy": "💊", "supermarket": "🛒", "bank": "🏦",
+  };
+  return map[type] || (cls === "highway" ? "🛣" : cls === "amenity" ? "📍" : cls === "building" ? "🏢" : "📍");
+}
+
+// ── PANELS ────────────────────────────────────────────────────────
+function openStopsPanel() {
+  document.getElementById("stops-panel").classList.add("open");
+  S.panelOpen = "stops";
+  renderStopsList();
+}
+function closeStopsPanel() {
+  document.getElementById("stops-panel").classList.remove("open");
+  if (S.panelOpen === "stops") S.panelOpen = null;
+}
+function toggleStopsPanel() {
+  if (S.panelOpen === "stops") closeStopsPanel();
+  else openStopsPanel();
+}
+
+let stylePicker = false;
+function toggleStylePicker(force) {
+  stylePicker = force !== undefined ? force : !stylePicker;
+  document.getElementById("map-style-picker").classList.toggle("hidden", !stylePicker);
+}
+
+// ── ARRIVING BANNER ────────────────────────────────────────────────
+function showArrivingBanner(stop) {
+  const el = document.getElementById("arriving-banner");
+  if (!el || el.classList.contains("show")) return;
+  setEl("arriving-name", stop.label || stop.address.split(",")[0]);
+  el.classList.add("show");
+}
+function hideArrivingBanner() {
+  document.getElementById("arriving-banner")?.classList.remove("show");
+}
+
+// ── FOLLOW MODE ────────────────────────────────────────────────────
+function toggleFollow() {
+  S.followMode = !S.followMode;
+  setFollowBtn(S.followMode);
+  if (S.followMode && S.userLat !== null) {
+    S.map.flyTo([S.userLat, S.userLon], S.activeIdx !== null ? CONFIG.map.followUserZoom : CONFIG.map.defaultZoom, { duration: 0.9 });
+  }
+}
+function setFollowBtn(on) {
+  document.getElementById("fab-follow")?.classList.toggle("active", on);
+}
+
+// ── BIND UI ────────────────────────────────────────────────────────
+function bindUI() {
+  initSearchAutocomplete();
+
+  document.getElementById("fab-follow")?.addEventListener("click", toggleFollow);
+  document.getElementById("fab-tilt")?.addEventListener("click", () => setTilt(!S.tilt3d));
+  document.getElementById("fab-layers")?.addEventListener("click", () => toggleStylePicker());
+  document.getElementById("fab-fit")?.addEventListener("click", () => {
+    const pts = [...S.stops, ...S.depots, ...(S.userLat ? [{ lat: S.userLat, lon: S.userLon }] : [])];
+    if (pts.length) S.map.fitBounds(L.latLngBounds(pts.map(p => [p.lat, p.lon])).pad(0.1));
+    S.followMode = false; setFollowBtn(false);
+  });
+
+  // Bottom nav
+  document.getElementById("nav-map")?.addEventListener("click", () => { closeStopsPanel(); closeStopDrawer(); });
+  document.getElementById("nav-stops")?.addEventListener("click", toggleStopsPanel);
+  document.getElementById("nav-recenter")?.addEventListener("click", () => {
+    if (S.userLat !== null) {
+      S.followMode = true; setFollowBtn(true);
+      S.map.flyTo([S.userLat, S.userLon], CONFIG.map.followUserZoom, { duration: 0.9 });
+    }
+  });
+  document.getElementById("nav-route")?.addEventListener("click", () => { runRoute(); toast("Route recalculated", "info"); });
+
+  // Drawer buttons
+  document.getElementById("drawer-btn-go")?.addEventListener("click", () => goToStop(S.drawerIdx));
+  document.getElementById("drawer-btn-done")?.addEventListener("click", () => markDone(S.drawerIdx));
+  document.getElementById("drawer-btn-reopen")?.addEventListener("click", () => reopenStop(S.drawerIdx));
+  document.getElementById("drawer-btn-nav")?.addEventListener("click", () => {
+    const s = S.drawerIdx != null ? S.stops[S.drawerIdx] : null;
+    if (s) window.open(`https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lon}&travelmode=driving`, "_blank");
+  });
+
+  // Panel close
+  document.getElementById("panel-close")?.addEventListener("click", closeStopsPanel);
+  document.getElementById("sheet-backdrop")?.addEventListener("click", () => { closeStopDrawer(); closeStopsPanel(); });
+
+  // Dest card tap → open drawer for active stop
+  document.getElementById("dest-card")?.addEventListener("click", () => {
+    if (S.activeIdx !== null) openStopDrawer(S.activeIdx);
+  });
+
+  // Arriving banner dismiss
+  document.getElementById("arriving-banner")?.addEventListener("click", () => {
+    if (S.activeIdx !== null) markDone(S.activeIdx);
+  });
+
+  // Close style picker on map click
+  S.map?.on("click", () => { if (stylePicker) toggleStylePicker(false); });
+}
+
+// ── HELPERS ────────────────────────────────────────────────────────
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const d1 = (lat2-lat1)*Math.PI/180, d2 = (lon2-lon1)*Math.PI/180;
+  const a = Math.sin(d1/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(d2/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function shortName(name) {
-  const parts = (name || "").split(",");
-  return parts[0].trim().substring(0, 28);
+function setEl(id, val) { const e = document.getElementById(id); if (e) e.textContent = val; }
+
+function fmtETA(minutes) {
+  const now = new Date();
+  now.setMinutes(now.getMinutes() + minutes);
+  const h = now.getHours(), m = now.getMinutes();
+  const ampm = h >= 12 ? "pm" : "am";
+  const hh = h % 12 || 12;
+  return `${hh}:${String(m).padStart(2,"0")}${ampm}`;
 }
 
-function setEl(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = val;
-}
-
-function guessZone(address) {
-  const p = address.split(",");
-  return p.length >= 2 ? p[p.length - 2].trim() : null;
-}
-
-function inlineLoader(show, msg = "") {
-  const el = document.getElementById("inline-loader");
-  const tx = document.getElementById("inline-loader-text");
-  if (!el) return;
-  el.classList.toggle("hidden", !show);
-  if (tx) tx.textContent = msg;
+function fmtDist(metres) {
+  if (metres < 1000) return `${Math.round(metres)}m`;
+  return `${(metres/1000).toFixed(1)}km`;
 }
 
 function toast(msg, type = "info") {
-  const c = document.getElementById("toast-container");
+  const c = document.getElementById("toast-host");
   if (!c) return;
   const el = document.createElement("div");
   el.className = `toast ${type}`;
   el.textContent = msg;
   c.appendChild(el);
-  setTimeout(() => el.remove(), CONFIG.ui.toastDuration);
+  setTimeout(() => el.remove(), CONFIG.ui.toastMs);
 }
